@@ -140,7 +140,7 @@ async def orders_command(
         await update.effective_message.reply_text(
             f"Sifariş: {order['id']}\n"
             f"Növ: {order['type']}\n"
-            f>Məbləğ: {order.get('amount', '—')}\n"
+            f"Məbləğ: {order.get('amount', '—')}\n"
             f"İstifadəçi ID: {order['user_id']}\n"
             f"Status: {order['status']}",
             reply_markup=keyboard,
