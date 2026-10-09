@@ -1,14 +1,12 @@
-
 import os
+import sqlite3
 import logging
-import asyncio
-import time
-import uuid
-
+from datetime import datetime
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
 )
 from telegram.ext import (
     Application,
@@ -18,512 +16,458 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-
-logging.basicConfig(
-    format="%(asctime)s %(levelname)s %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ["BOT_TOKEN"]
 ADMIN_USERNAME = os.getenv(
     "ADMIN_USERNAME", "lion12355663"
-).strip().lstrip("@").lower()
-
-BANK_CARD = os.getenv("BANK_CARD", "").strip()
-USDT_ADDRESS = os.getenv("USDT_ADDRESS", "").strip()
-
+).lstrip("@").lower()
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+BANK_CARD = os.getenv("BANK_CARD", "")
+USDT_ADDRESS = os.getenv("USDT_ADDRESS", "")
 BUY_RATE = 1.70
 SELL_RATE = 1.69
-ORDER_TIMEOUT = 300
-
-# Sınaq üçün yaddaşda saxlanılır.
-ORDERS = {}
-USER_ACTIVE_ORDER = {}
-
-BUY_MENU = InlineKeyboardMarkup([
-    [InlineKeyboardButton("🟢 USDT alışı", callback_data="buy")],
-    [InlineKeyboardButton("🔴 USDT satışı", callback_data="sell")],
-])
-
-def is_admin(user):
+DB_FILE = "orders.db"
+def db():
+    con = sqlite3.connect(DB_FILE)
+    con.row_factory = sqlite3.Row
+    return con
+def init_db():
+    with db() as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT,
+                kind TEXT NOT NULL,
+                amount TEXT,
+                wallet TEXT,
+                txid TEXT,
+                card TEXT,
+                status TEXT NOT NULL,
+                created TEXT NOT NULL
+            )
+        """)
+def new_order(user, kind):
+    with db() as con:
+        cur = con.execute("""
+            INSERT INTO orders
+            (user_id, username, kind, status, created)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            user.id,
+            user.username or "",
+            kind,
+            "enter_amount",
+            datetime.now().isoformat(timespec="seconds"),
+        ))
+        return cur.lastrowid
+def get_order(order_id):
+    with db() as con:
+        return con.execute(
+            "SELECT * FROM orders WHERE id = ?", (order_id,)
+        ).fetchone()
+def update_order(order_id, **fields):
+    if not fields:
+        return
+    allowed = {
+        "amount", "wallet", "txid", "card", "status"
+    }
+    if any(k not in allowed for k in fields):
+        raise ValueError("Invalid field")
+    sql = ", ".join(f"{k} = ?" for k in fields)
+    values = list(fields.values()) + [order_id]
+    with db() as con:
+        con.execute(
+            f"UPDATE orders SET {sql} WHERE id = ?", values
+        )
+def is_admin(update):
+    user = update.effective_user
     return bool(
         user
         and user.username
         and user.username.lower() == ADMIN_USERNAME
     )
-
-def main_menu():
-    return BUY_MENU
-
+async def notify_admin(context, text, keyboard=None):
+    chat_id = ADMIN_CHAT_ID or context.application.bot_data.get(
+        "admin_chat_id"
+    )
+    if not chat_id:
+        logging.warning(
+            "Admin chat ID yoxdur. Admin botda /start etməlidir."
+        )
+        return False
+    await context.bot.send_message(
+        chat_id=int(chat_id),
+        text=text,
+        reply_markup=keyboard,
+    )
+    return True
+def admin_buttons(order_id, action):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Təsdiqlə / tamamla",
+            callback_data=f"{action}:{order_id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Rədd et",
+            callback_data=f"reject:{order_id}"
+        ),
+    ]])
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-
-    if not user:
-        return
-
-    if is_admin(user):
-        await update.effective_message.reply_text(
-            "👋 Admin paneli.\n\n"
-            "Gözləyən sifarişləri görmək üçün /orders yaz."
+    if is_admin(update):
+        context.application.bot_data["admin_chat_id"] = user.id
+        await update.message.reply_text(
+            "Admin panelinə xoş gəldin.\n"
+            "Sifarişləri görmək üçün /orders yaz."
         )
         return
-
-    await update.effective_message.reply_text(
-        "Salam! 👋 USDT mübadilə botuna xoş gəlmisiniz.\n\n"
-        f"🟢 USDT alış kursu: 1 USDT = {BUY_RATE:.2f} AZN\n"
-        f"🔴 USDT satış kursu: 1 USDT = {SELL_RATE:.2f} AZN\n\n"
-        "Davam etmək üçün əməliyyatı seçin:",
-        reply_markup=main_menu(),
+    keyboard = ReplyKeyboardMarkup(
+        [["🟢 USDT alışı", "🔴 USDT satışı"]],
+        resize_keyboard=True,
     )
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if not user:
-        return
-
-    order_id = USER_ACTIVE_ORDER.get(user.id)
-    order = ORDERS.get(order_id) if order_id else None
-
-    if order and order["status"] in ("waiting_payment", "waiting_receipt"):
-        order["status"] = "cancelled"
-        USER_ACTIVE_ORDER.pop(user.id, None)
-        await update.effective_message.reply_text(
-            "Sifariş ləğv edildi. /start ilə yenidən başlaya bilərsiniz."
-        )
-    else:
-        await update.effective_message.reply_text(
-            "Ləğv ediləcək aktiv sifariş tapılmadı."
-        )
-
+    await update.message.reply_text(
+        "Salam! USDT mübadilə botuna xoş gəlmisiniz.\n"
+        f"USDT alışı: 1 USDT = {BUY_RATE} AZN\n"
+        f"USDT satışı: 1 USDT = {SELL_RATE} AZN\n\n"
+        "Davam etmək üçün seçim edin.",
+        reply_markup=keyboard,
+    )
 async def orders_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    if not is_admin(update.effective_user):
-        await update.effective_message.reply_text("Bu əmr yalnız admin üçündür.")
+    if not is_admin(update):
+        await update.message.reply_text("Bu əmr yalnız admin üçündür.")
         return
-
-    pending = [
-        order for order in ORDERS.values()
-        if order["status"] in (
-            "waiting_receipt",
-            "checking_payment",
-            "waiting_wallet",
-            "waiting_usdt",
-            "checking_usdt",
-            "waiting_card",
-            "checking_payout",
-        )
-    ]
-
-    if not pending:
-        await update.effective_message.reply_text(
-            "Hazırda gözləyən sifariş yoxdur."
-        )
+    with db() as con:
+        rows = con.execute("""
+            SELECT * FROM orders
+            WHERE status NOT IN ('completed', 'rejected')
+            ORDER BY id DESC LIMIT 20
+        """).fetchall()
+    if not rows:
+        await update.message.reply_text("Aktiv sifariş yoxdur.")
         return
-
-    for order in pending:
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "Təsdiqlə",
-                    callback_data=f"approve:{order['id']}",
-                ),
-                InlineKeyboardButton(
-                    "Rədd et",
-                    callback_data=f"reject:{order['id']}",
-                ),
-            ]
-        ])
-
-        await update.effective_message.reply_text(
-            f"Sifariş: {order['id']}\n"
-            f"Növ: {order['type']}\n"
-            f"Məbləğ: {order.get('amount', '—')}\n"
-            f"İstifadəçi ID: {order['user_id']}\n"
-            f"Status: {order['status']}",
-            reply_markup=keyboard,
-        )
-
-async def choose_operation(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    choice = query.data
-
-    if choice not in ("buy", "sell"):
-        return
-
-    existing_id = USER_ACTIVE_ORDER.get(user.id)
-    existing = ORDERS.get(existing_id) if existing_id else None
-
-    if existing and existing["status"] not in ("cancelled", "rejected", "completed"):
-        await query.message.reply_text(
-            "Sizin artıq aktiv sifarişiniz var. Əvvəl onu tamamlayın "
-            "və ya /cancel yazın."
-        )
-        return
-
-    order_id = uuid.uuid4().hex[:8].upper()
-    order = {
-        "id": order_id,
-        "user_id": user.id,
-        "username": user.username or "",
-        "type": choice,
-        "status": "waiting_amount",
-        "created": time.time(),
-    }
-    ORDERS[order_id] = order
-    USER_ACTIVE_ORDER[user.id] = order_id
-    context.user_data["active_order"] = order_id
-
-    if choice == "buy":
+    for o in rows:
         text = (
-            "🟢 USDT alışı\n"
-            f"Kurs: 1 USDT = {BUY_RATE:.2f} AZN\n\n"
-            "Neçə USDT almaq istəyirsiniz? Məbləği rəqəmlə göndərin."
+            f"Sifariş: #{o['id']}\n"
+            f"Növ: {o['kind']}\n"
+            f"Məbləğ: {o['amount'] or 'hələ daxil edilməyib'}\n"
+            f"Müştəri ID: {o['user_id']}\n"
+            f"İstifadəçi: @{o['username'] or 'yoxdur'}\n"
+            f"TRC20 ünvanı: {o['wallet'] or 'yoxdur'}\n"
+            f"TXID: {o['txid'] or 'yoxdur'}\n"
+            f"Bank kartı: {o['card'] or 'yoxdur'}\n"
+            f"Status: {o['status']}"
         )
-    else:
-        text = (
-            "🔴 USDT satışı\n"
-            f"Kurs: 1 USDT = {SELL_RATE:.2f} AZN\n\n"
-            "Neçə USDT satmaq istəyirsiniz? Məbləği rəqəmlə göndərin."
-        )
-
-    await query.message.reply_text(text)
-
+        await update.message.reply_text(text)
 async def handle_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     user = update.effective_user
     message = update.effective_message
-
-    if not user or not message:
+    text = (message.text or "").strip() if message else ""
+    if not text:
         return
-
-    if is_admin(user):
+    if text in ("🟢 USDT alışı", "🔴 USDT satışı"):
+        kind = "buy" if text == "🟢 USDT alışı" else "sell"
+        order_id = new_order(user, kind)
+        context.user_data["active_order"] = order_id
+        if kind == "buy":
+            update_order(order_id, status="enter_amount")
+            await message.reply_text(
+                f"USDT alışı seçildi. Kurs: {BUY_RATE} AZN.\n"
+                "Neçə USDT almaq istəyirsiniz? Məbləği rəqəmlə yazın."
+            )
+        else:
+            update_order(order_id, status="enter_amount")
+            await message.reply_text(
+                f"USDT satışı seçildi. Kurs: {SELL_RATE} AZN.\n"
+                "Neçə USDT satmaq istəyirsiniz? Məbləği rəqəmlə yazın."
+            )
+        return
+    order_id = context.user_data.get("active_order")
+    if not order_id:
         await message.reply_text(
-            "Admin əmrləri: /orders\n"
-            "Sifarişin təsdiqi və rəddi üçün /orders panelindəki düymələrdən istifadə edin."
+            "Başlamaq üçün /start yazın və seçim edin."
         )
         return
-
-    order_id = USER_ACTIVE_ORDER.get(user.id)
-    order = ORDERS.get(order_id) if order_id else None
-
-    if not order:
-        await message.reply_text(
-            "Aktiv sifarişiniz yoxdur. /start yazaraq başlayın."
-        )
+    order = get_order(order_id)
+    if not order or order["user_id"] != user.id:
+        context.user_data.pop("active_order", None)
+        await message.reply_text("Sifariş tapılmadı. /start yazın.")
         return
-
-    if order["status"] == "waiting_amount":
-        if not message.text:
-            await message.reply_text("Zəhmət olmasa məbləği rəqəmlə göndərin.")
-            return
-
+    status = order["status"]
+    if status == "enter_amount":
         try:
-            amount = float(message.text.replace(",", ".").strip())
-            if not (0 < amount <= 1000000):
+            amount = float(text.replace(",", "."))
+            if amount <= 0 or amount > 100000000:
                 raise ValueError
         except ValueError:
-            await message.reply_text(
-                "Düzgün məbləğ daxil edin. Məsələn: 100"
-            )
+            await message.reply_text("Zəhmət olmasa düzgün məbləğ yazın.")
             return
-
-        order["amount"] = round(amount, 4)
-        order["azn"] = round(
-            amount * (BUY_RATE if order["type"] == "buy" else SELL_RATE),
-            2,
-        )
-
-        if order["type"] == "buy":
-            order["status"] = "waiting_receipt"
-            order["deadline"] = time.time() + ORDER_TIMEOUT
-
+        update_order(order_id, amount=f"{amount:g}")
+        if order["kind"] == "buy":
             if not BANK_CARD:
                 await message.reply_text(
-                    "Bank kartı hələ konfiqurasiya edilməyib. "
-                    "Zəhmət olmasa sonra yenidən cəhd edin."
+                    "Ödəniş kartı hələ konfiqurasiya edilməyib. Adminlə əlaqə saxlayın."
                 )
-                order["status"] = "cancelled"
-                USER_ACTIVE_ORDER.pop(user.id, None)
                 return
-
+            update_order(order_id, status="waiting_receipt")
             await message.reply_text(
-                f"Sifariş #{order_id}\n"
-                f"Məbləğ: {amount:g} USDT\n"
-                f"Ödəniş: {order['azn']:.2f} AZN\n\n"
-                f"Bank kartı: {BANK_CARD}\n\n"
-                "Ödənişi 5 dəqiqə ərzində edin və qəbzin şəklini göndərin. "
-                "Ödəniş etmədən qəbz göndərməyin."
+                f"{amount:g} USDT üçün məbləğ: "
+                f"{amount * BUY_RATE:.2f} AZN.\n"
+                f"Ödəniş kartı: {BANK_CARD}\n"
+                "5 dəqiqə ərzində ödəniş edin və qəbzin şəklini göndərin."
             )
         else:
-            order["status"] = "waiting_usdt"
-            order["deadline"] = time.time() + ORDER_TIMEOUT
-
             if not USDT_ADDRESS:
                 await message.reply_text(
-                    "USDT ünvanı hələ konfiqurasiya edilməyib. "
-                    "Zəhmət olmasa sonra yenidən cəhd edin."
+                    "USDT ünvanı hələ konfiqurasiya edilməyib. Adminlə əlaqə saxlayın."
                 )
-                order["status"] = "cancelled"
-                USER_ACTIVE_ORDER.pop(user.id, None)
                 return
-
+            update_order(order_id, status="waiting_txid")
             await message.reply_text(
-                f"Sifariş #{order_id}\n"
-                f"Siz göndərəcəksiniz: {amount:g} USDT\n"
-                f"Təxmini ödəniş: {order['azn']:.2f} AZN\n\n"
-                f"TRC20 ünvanı: {USDT_ADDRESS}\n\n"
-                "Köçürməni 5 dəqiqə ərzində edin. "
-                "Sonra əməliyyatın TXID-sini mətnlə göndərin. "
-                "Şəbəkədə təsdiq yoxlanmadan sifariş təsdiqlənməyəcək."
+                f"{amount:g} USDT göndərin bu TRC20 ünvanına:\n"
+                f"{USDT_ADDRESS}\n\n"
+                "Transfer tamamlandıqdan sonra TXID-ni göndərin. "
+                "Göndərişi admin yoxlayacaq."
             )
         return
-
-    if order["status"] == "waiting_receipt":
-        if time.time() > order["deadline"]:
-            order["status"] = "cancelled"
-            USER_ACTIVE_ORDER.pop(user.id, None)
+    if status == "waiting_wallet" and order["kind"] == "buy":
+        wallet = text
+        if not wallet.startswith("T") or len(wallet) != 34:
             await message.reply_text(
-                "5 dəqiqəlik müddət bitdi. Sifariş ləğv edildi. /start yazın."
+                "Bu, düzgün TRON/TRC20 ünvanına oxşamır. "
+                "Ünvan adətən T ilə başlayır və 34 simvol olur. Yenidən göndərin."
             )
             return
-
-        if not message.photo:
-            await message.reply_text("Zəhmət olmasa ödəniş qəbzinin şəklini göndərin.")
-            return
-
-        order["status"] = "checking_payment"
-        await message.reply_text(
-            "Qəbz qəbul edildi. Admin ödənişi real olaraq yoxlayacaq. "
-            "Yoxlama bitənədək gözləyin."
+        update_order(
+            order_id, wallet=wallet, status="checking_payout"
         )
-
-        await notify_admin(context, order, message.photo[-1].file_id)
+        o = get_order(order_id)
+        sent = await notify_admin(
+            context,
+            "🟡 USDT ALIŞI — köçürmə gözləyir\n\n"
+            f"Sifariş: #{o['id']}\n"
+            f"Məbləğ: {o['amount']} USDT\n"
+            f"Müştəri ID: {o['user_id']}\n"
+            f"TRC20 ünvanı: {wallet}\n\n"
+            "Köçürməni əl ilə yoxlayın. Yalnız göndərdikdən sonra təsdiqləyin.",
+            admin_buttons(order_id, "buy_paid"),
+        )
+        await message.reply_text(
+            "TRC20 ünvanınız adminə göndərildi. "
+            "Köçürmə yoxlanılır."
+            if sent else
+            "Ünvan qəbul edildi, amma adminə bildiriş göndərilmədi. "
+            "Zəhmət olmasa adminlə əlaqə saxlayın."
+        )
         return
-
-    if order["status"] == "waiting_usdt":
-        if time.time() > order["deadline"]:
-            order["status"] = "cancelled"
-            USER_ACTIVE_ORDER.pop(user.id, None)
-            await message.reply_text(
-                "5 dəqiqəlik müddət bitdi. Sifariş ləğv edildi. /start yazın."
-            )
-            return
-
-        txid = (message.text or "").strip()
+    if status == "waiting_txid" and order["kind"] == "sell":
+        txid = text
         if len(txid) < 20 or len(txid) > 150:
-            await message.reply_text(
-                "Zəhmət olmasa əməliyyatın düzgün TXID-sini göndərin."
-            )
+            await message.reply_text("Zəhmət olmasa düzgün TXID göndərin.")
             return
-
-        order["txid"] = txid
-        order["status"] = "checking_usdt"
-        await message.reply_text(
-            "TXID qəbul edildi. Admin əməliyyatı yoxlayacaq. "
-            "Şəbəkə təsdiqi yoxlanmadan ödəniş təsdiqlənmir."
+        update_order(order_id, txid=txid, status="checking_usdt")
+        o = get_order(order_id)
+        sent = await notify_admin(
+            context,
+            "🟡 USDT SATIŞI — depozit yoxlanmalıdır\n\n"
+            f"Sifariş: #{o['id']}\n"
+            f"Məbləğ: {o['amount']} USDT\n"
+            f"Müştəri ID: {o['user_id']}\n"
+            f"TXID: {txid}\n"
+            "Blockchain-də transferi yoxlayın. "
+            "Depozit təsdiqlənmədən təsdiq düyməsinə basmayın.",
+            admin_buttons(order_id, "sell_deposit"),
         )
-        await notify_admin(context, order)
-        return
-
-    if order["status"] == "waiting_wallet":
-        wallet = (message.text or "").strip()
-        if not wallet.startswith("T") or len(wallet) < 30 or len(wallet) > 40:
-            await message.reply_text(
-                "TRC20 ünvanı düzgün görünmür. Ünvanı yenidən göndərin."
-            )
-            return
-
-        order["wallet"] = wallet
-        order["status"] = "checking_payout"
         await message.reply_text(
-            "TRC20 ünvanı qəbul edildi. Admin sifarişi yoxlayacaq. "
-            "Təsdiq olunmadan USDT göndərilmir."
+            "TXID adminə göndərildi. Depozit yoxlanılır."
+            if sent else
+            "TXID qəbul edildi, amma adminə bildiriş göndərilmədi."
         )
-        await notify_admin(context, order)
         return
-
-    if order["status"] == "waiting_card":
-        card = (message.text or "").strip()
-        digits = "".join(ch for ch in card if ch.isdigit())
-        if len(digits) < 16 or len(digits) > 19:
-            await message.reply_text(
-                "Zəhmət olmasa bank kartı nömrəsini yenidən yoxlayın."
-            )
-            return
-
-        order["payout_card"] = digits
-        order["status"] = "checking_payout"
+    if status == "waiting_card" and order["kind"] == "sell":
+        update_order(order_id, card=text, status="checking_payout")
+        o = get_order(order_id)
+        sent = await notify_admin(
+            context,
+            "🟡 USDT SATIŞI — bank ödənişi gözləyir\n\n"
+            f"Sifariş: #{o['id']}\n"
+            f"Məbləğ: {o['amount']} USDT\n"
+            f"Ödəniləcək: {float(o['amount']) * SELL_RATE:.2f} AZN\n"
+            f"Müştəri ID: {o['user_id']}\n"
+            f"TXID: {o['txid']}\n"
+            f"Bank kartı: {text}\n\n"
+            "Bank köçürməsini etdikdən sonra təsdiqləyin.",
+            admin_buttons(order_id, "sell_paid"),
+        )
         await message.reply_text(
-            "Kart məlumatı qəbul edildi. Admin ödənişi yoxlayacaq. "
-            "Təsdiq olmadan köçürmə edilməyəcək."
+            "Bank kartı adminə göndərildi. Ödəniş yoxlanılır."
+            if sent else
+            "Kart məlumatı qəbul edildi, amma adminə bildiriş göndərilmədi."
         )
-        await notify_admin(context, order)
         return
-
     await message.reply_text(
-        f"Sifariş statusu: {order['status']}. /cancel və ya /start istifadə edin."
+        "Sifarişinizin hazırkı statusu: "
+        f"{status}. Yeni seçim üçün /start yazın."
     )
-
-async def notify_admin(
-    context: ContextTypes.DEFAULT_TYPE,
-    order: dict,
-    receipt_file_id: str = "",
+async def handle_photo(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    # Admin istifadəçi adı ilə tapılır; əvvəl botu açıb /start yazmalıdır.
-    # Bot Telegram-dan istifadəçi adını axtarıb şəxsi mesaj başlada bilməz.
-    for chat_id in context.application.bot_data.get("admin_chat_ids", set()):
-        text = (
-            f"Yeni yoxlama tələb olunur\n"
-            f"Sifariş: {order['id']}\n"
-            f"Növ: {order['type']}\n"
-            f"Məbləğ: {order.get('amount', '—')}\n"
-            f"AZN: {order.get('azn', '—')}\n"
-            f"İstifadəçi ID: {order['user_id']}\n"
-            f"Status: {order['status']}\n"
-            f"TXID: {order.get('txid', '—')}"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("Təsdiqlə", callback_data=f"approve:{order['id']}"),
-                InlineKeyboardButton("Rədd et", callback_data=f"reject:{order['id']}"),
-            ]
-        ])
-        if receipt_file_id:
-            await context.bot.send_photo(
-                chat_id=chat_id,
-                photo=receipt_file_id,
-                caption=text,
-                reply_markup=keyboard,
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=text,
-                reply_markup=keyboard,
-            )
-
-async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if is_admin(user):
-        context.application.bot_data.setdefault("admin_chat_ids", set()).add(user.id)
+    order_id = context.user_data.get("active_order")
+    if not order_id:
         await update.effective_message.reply_text(
-            "Admin aktivdir. /orders yazaraq sifarişləri görə bilərsiniz."
+            "Əvvəl /start yazıb sifariş yaradın."
         )
-    else:
-        await start(update, context)
-
-async def admin_action(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+        return
+    order = get_order(order_id)
+    if (
+        not order
+        or order["user_id"] != user.id
+        or order["kind"] != "buy"
+        or order["status"] != "waiting_receipt"
+    ):
+        await update.effective_message.reply_text(
+            "Hazırda qəbz gözləyən alış sifarişiniz yoxdur."
+        )
+        return
+    update_order(order_id, status="checking_receipt")
+    o = get_order(order_id)
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "✅ Qəbzi təsdiqlə",
+            callback_data=f"receipt_ok:{order_id}"
+        ),
+        InlineKeyboardButton(
+            "❌ Rədd et",
+            callback_data=f"reject:{order_id}"
+        ),
+    ]])
+    chat_id = ADMIN_CHAT_ID or context.application.bot_data.get(
+        "admin_chat_id"
+    )
+    if not chat_id:
+        update_order(order_id, status="waiting_receipt")
+        await update.effective_message.reply_text(
+            "Admin botu açıb /start yazmalıdır. Sonra qəbzi yenidən göndərin."
+        )
+        return
+    await context.bot.send_photo(
+        chat_id=int(chat_id),
+        photo=update.effective_message.photo[-1].file_id,
+        caption=(
+            f"🧾 ÖDƏNİŞ QƏBZİ\nSifariş: #{o['id']}\n"
+            f"Məbləğ: {o['amount']} USDT\n"
+            f"Müştəri ID: {o['user_id']}\n"
+            "Ödənişi bankdan yoxlayın."
+        ),
+        reply_markup=keyboard,
+    )
+    await update.effective_message.reply_text(
+        "Qəbz adminə göndərildi. Ödəniş yoxlanılır."
+    )
+async def admin_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
     await query.answer()
-
-    if not is_admin(query.from_user):
-        await query.message.reply_text("Bu əməliyyat yalnız admin üçündür.")
+    if not is_admin(update):
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text("Bu düymə yalnız admin üçündür.")
         return
-
-    action, order_id = query.data.split(":", 1)
-    order = ORDERS.get(order_id)
-
-    if not order:
-        await query.message.reply_text(
-            "Sifariş tapılmadı. Bot yenidən başladığı üçün yaddaş təmizlənmiş ola bilər."
-        )
+    action, order_id_text = query.data.split(":")
+    order_id = int(order_id_text)
+    o = get_order(order_id)
+    if not o:
+        await query.message.reply_text("Sifariş tapılmadı.")
         return
-
     if action == "reject":
-        order["status"] = "rejected"
-        USER_ACTIVE_ORDER.pop(order["user_id"], None)
+        update_order(order_id, status="rejected")
         await context.bot.send_message(
-            chat_id=order["user_id"],
-            text=f"Sifariş #{order_id} admin tərəfindən rədd edildi. /start ilə yenidən cəhd edin.",
+            chat_id=o["user_id"],
+            text=f"❌ Sifariş #{order_id} rədd edildi. Adminlə əlaqə saxlayın."
         )
         await query.edit_message_reply_markup(reply_markup=None)
-        await query.message.reply_text("Sifariş rədd edildi.")
-        return
-
-    # Təsdiq düyməsi yalnız yoxlama prosesini irəli aparır.
-    # Bot özü bank və blockchain ödənişlərini yoxlamır və köçürmə etmir.
-    if order["type"] == "buy" and order["status"] == "checking_payment":
-        order["status"] = "waiting_wallet"
-        await context.bot.send_message(
-            chat_id=order["user_id"],
-            text=(
-                "Admin ödənişi yoxladığını təsdiqlədi. "
-                "USDT almaq üçün TRC20 cüzdan ünvanınızı göndərin."
-            ),
-        )
-    elif order["type"] == "sell" and order["status"] == "checking_usdt":
-        order["status"] = "waiting_card"
-        await context.bot.send_message(
-            chat_id=order["user_id"],
-            text=(
-                "Admin yoxlama mərhələsini təsdiqlədi. "
-                "AZN ödənişi üçün bank kartı nömrənizi göndərin."
-            ),
-        )
-    elif order["status"] == "checking_payout":
-        # Real köçürmə həyata keçirilmir. Son təsdiq üçün təhlükəsiz saxlanılır.
-        order["status"] = "approved_pending_manual_transfer"
-        await context.bot.send_message(
-            chat_id=order["user_id"],
-            text=(
-                "Sifariş yoxlamadan keçdi və əl ilə köçürmə üçün növbəyə alındı. "
-                "Bu bot avtomatik köçürmə etmir. Köçürmə real olaraq tamamlanandan "
-                "sonra admin sifarişi əl ilə bağlamalıdır."
-            ),
-        )
-    else:
         await query.message.reply_text(
-            f"Bu status üçün təsdiq mümkün deyil: {order['status']}"
+            f"Sifariş #{order_id} rədd edildi."
         )
         return
-
-    await query.edit_message_reply_markup(reply_markup=None)
-    await query.message.reply_text(
-        f"Sifariş #{order_id} növbəti mərhələyə keçirildi: {order['status']}"
-    )
-
-async def error_handler(
-    update: object,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    logging.exception("Bot xətası", exc_info=context.error)
-
-def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN Render Environment Variables bölməsində yoxdur.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", admin_start))
-    app.add_handler(CommandHandler("cancel", cancel))
-    app.add_handler(CommandHandler("orders", orders_command))
-    app.add_handler(CallbackQueryHandler(admin_action, pattern=r"^(approve|reject):"))
-    app.add_handler(CallbackQueryHandler(choose_operation, pattern=r"^(buy|sell)$"))
-    app.add_handler(
-        MessageHandler(
-            (filters.TEXT | filters.PHOTO) & ~filters.COMMAND,
-            handle_message,
+    if action == "receipt_ok":
+        if o["status"] != "checking_receipt":
+            await query.message.reply_text("Bu qəbz artıq işlənib.")
+            return
+        update_order(order_id, status="waiting_wallet")
+        context.application.bot_data.setdefault(
+            "user_order", {}
+        )[o["user_id"]] = order_id
+        await context.bot.send_message(
+            chat_id=o["user_id"],
+            text=(
+                f"✅ Sifariş #{order_id} üçün qəbz admin tərəfindən təsdiqləndi.\n"
+                "İndi USDT almaq istədiyiniz TRC20 pul kisəsi ünvanını göndərin."
+            )
         )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"Qəbz təsdiqləndi. Sifariş #{order_id}: TRC20 ünvanı gözlənilir."
+        )
+        return
+    if action == "sell_deposit":
+        if o["status"] != "checking_usdt":
+            await query.message.reply_text("Bu sifariş artıq işlənib.")
+            return
+        update_order(order_id, status="waiting_card")
+        await context.bot.send_message(
+            chat_id=o["user_id"],
+            text=(
+                f"✅ Sifariş #{order_id}: depozit admin tərəfindən təsdiqləndi.\n"
+                "Bank köçürməsi üçün kart nömrənizi göndərin."
+            )
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"Depozit təsdiqləndi. Sifariş #{order_id}: bank kartı gözlənilir."
+        )
+        return
+    if action in ("buy_paid", "sell_paid"):
+        if o["status"] != "checking_payout":
+            await query.message.reply_text(
+                "Sifariş köçürmə gözləyən statusda deyil."
+            )
+            return
+        update_order(order_id, status="completed")
+        await context.bot.send_message(
+            chat_id=o["user_id"],
+            text=(
+                f"✅ Sifariş #{order_id} admin tərəfindən tamamlandı.\n"
+                "Admin köçürmənin tamamlandığını təsdiqlədi."
+            )
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await query.message.reply_text(
+            f"✅ Sifariş #{order_id} tamamlandı. Müştəriyə bildiriş göndərildi."
+        )
+        return
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("active_order", None)
+    await update.effective_message.reply_text(
+        "Aktiv sifariş seçimi sıfırlandı. /start yazaraq yenidən başlayın."
     )
-    app.add_error_handler(error_handler)
-
-    # Python 3.14-də hadisə dövrəsini əvvəlcədən yaradırıq.
-    asyncio.set_event_loop(asyncio.new_event_loop())
+def main():
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("orders", orders_command))
+    app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CallbackQueryHandler(admin_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+    )
     app.run_polling()
-
 if __name__ == "__main__":
     main()
